@@ -87,6 +87,8 @@ def _render_result(message: dict[str, Any], registry: DatasetRegistry) -> None:
             if "records" in result:
                 table = pd.DataFrame(result["records"], columns=result.get("columns"))
                 st.dataframe(table, use_container_width=True, hide_index=True)
+                if result.get("insight_note"):
+                    st.caption(result["insight_note"])
                 _render_result_chart(result, table, index)
                 if result.get("operation") in {"keyword_frequency_by_group", "distinctive_keywords_by_group", "text_length_analysis"}:
                     st.download_button(

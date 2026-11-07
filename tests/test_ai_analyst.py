@@ -124,6 +124,37 @@ def test_local_keyword_question_executes_and_returns_actual_results():
     assert "calculated table" in explanation.answer
 
 
+def test_broad_insight_request_runs_argument_free_pattern_discovery():
+    frame = pd.DataFrame({
+        "id": [f"i{i}" for i in range(6)],
+        "prompt_id": [f"p{i % 2}" for i in range(6)],
+        "text": ["amber amber bright river passage", "amber bright river passage", "amber amber calm river passage",
+                 "blue blue quiet engine passage", "blue quiet engine passage", "blue blue loud engine passage"],
+        "model": ["model-a"] * 3 + ["model-b"] * 3,
+    })
+    plan = rule_based_plan("What insights and patterns do you see? What makes them different?", frame)
+    assert [operation.operation for operation in plan.operations] == ["discover_insights"]
+    result = execute_plan(frame, plan)[1]
+    text_findings = [row for row in result["records"] if row["pattern"] == "Text pattern"]
+    assert {row["columns"] for row in text_findings} == {"text, model"}
+    assert any("amber" in row["finding"] for row in text_findings)
+    assert any("blue" in row["finding"] for row in text_findings)
+
+
+def test_general_insight_tool_repairs_missing_category_column_by_scanning_patterns():
+    from src.ai.analyst_service import GeminiAnalyst
+    frame = pd.DataFrame({"kind": ["A", "A", "B"], "value": [1, 2, 8]})
+    analyst = GeminiAnalyst("unused")
+    payload, operations, results = analyst._execute_tool(
+        "execute_dataframe_analysis", {"operations": [{"operation": "count_categories"}]}, frame,
+        "sample.csv", "dataset-1", "What are the insights in this data?",
+    )
+    assert "discover_insights" in [operation.operation for operation in operations]
+    insight_result = next(item for item in results if item["operation"] == "discover_insights")
+    assert insight_result["records"]
+    assert payload["operations"][0] == "discover_insights"
+
+
 def test_gemini_native_tool_result_is_returned_for_followup_explanation(monkeypatch, caplog):
     from types import SimpleNamespace
     from src.ai.analyst_service import GeminiAnalyst
