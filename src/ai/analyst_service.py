@@ -912,12 +912,10 @@ class GeminiAnalyst:
             raise AnalystError(f"Unsupported analysis tool '{name}'. Use one of the registered DataPilot tools.")
         requested_operations = raw_args.get("operations") or []
         if _general_insight_request(intent_context):
-            # Broad insight questions are answered with the whole-data scan,
-            # even if the model initially proposes a narrow/incomplete tool.
-            requested_operations = [item for item in requested_operations
-                                    if not (isinstance(item, dict) and item.get("operation") == "count_categories" and not item.get("column"))]
-            if not any(isinstance(item, dict) and item.get("operation") == "discover_insights" for item in requested_operations):
-                requested_operations.insert(0, {"operation": "discover_insights"})
+            # Broad insight questions are answered by the no-argument scan.
+            # Discard narrower model guesses: incomplete grouped aggregations
+            # should never prevent a general insight answer from completing.
+            requested_operations = [{"operation": "discover_insights"}]
         plan_data = {"operations": requested_operations}
         plan = AnalysisPlan.model_validate(plan_data)
         normalized = resolve_plan_columns(plan, dataframe, intent_context)

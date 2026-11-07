@@ -141,15 +141,18 @@ def test_broad_insight_request_runs_argument_free_pattern_discovery():
     assert any("blue" in row["finding"] for row in text_findings)
 
 
-def test_general_insight_tool_repairs_missing_category_column_by_scanning_patterns():
+def test_general_insight_tool_ignores_incomplete_operation_guesses_and_scans_patterns():
     from src.ai.analyst_service import GeminiAnalyst
     frame = pd.DataFrame({"kind": ["A", "A", "B"], "value": [1, 2, 8]})
     analyst = GeminiAnalyst("unused")
     payload, operations, results = analyst._execute_tool(
-        "execute_dataframe_analysis", {"operations": [{"operation": "count_categories"}]}, frame,
+        "execute_dataframe_analysis", {"operations": [
+            {"operation": "count_categories"},
+            {"operation": "group_aggregate", "group_by": "kind", "aggregation": "mean"},
+        ]}, frame,
         "sample.csv", "dataset-1", "What are the insights in this data?",
     )
-    assert "discover_insights" in [operation.operation for operation in operations]
+    assert [operation.operation for operation in operations] == ["discover_insights"]
     insight_result = next(item for item in results if item["operation"] == "discover_insights")
     assert insight_result["records"]
     assert payload["operations"][0] == "discover_insights"
