@@ -131,14 +131,44 @@ def test_broad_insight_request_runs_argument_free_pattern_discovery():
         "text": ["amber amber bright river passage", "amber bright river passage", "amber amber calm river passage",
                  "blue blue quiet engine passage", "blue quiet engine passage", "blue blue loud engine passage"],
         "model": ["model-a"] * 3 + ["model-b"] * 3,
+        "channel": ["web"] * 3 + ["store"] * 3,
+        "metric": [1, 2, 2, 10, 11, 12],
     })
     plan = rule_based_plan("What insights and patterns do you see? What makes them different?", frame)
     assert [operation.operation for operation in plan.operations] == ["discover_insights"]
     result = execute_plan(frame, plan)[1]
     text_findings = [row for row in result["records"] if row["pattern"] == "Text pattern"]
-    assert {row["columns"] for row in text_findings} == {"text, model"}
+    assert {"text, model", "text, channel"}.issubset({row["columns"] for row in text_findings})
     assert any("amber" in row["finding"] for row in text_findings)
     assert any("blue" in row["finding"] for row in text_findings)
+    assert any(row["pattern"] == "Category association" for row in result["records"])
+    assert any(row["pattern"] == "Group difference" for row in result["records"])
+
+
+def test_general_insight_question_uses_one_pandas_scan_and_gemini_explains_results(monkeypatch):
+    from src.ai.analyst_service import GeminiAnalyst, ExplanationResponse
+    frame = pd.DataFrame({"kind": ["a", "a", "b", "b"], "value": [1, 2, 9, 10]})
+    captured = {}
+
+    def fail_tool_loop(*args, **kwargs):
+        raise AssertionError("Broad insight requests should not enter Gemini's multi-tool loop.")
+
+    def explain(self, question, results, history=None):
+        captured["question"] = question
+        captured["operations"] = [item["operation"] for item in results]
+        captured["finding_count"] = len(results[1]["records"])
+        return ExplanationResponse(answer="Pandas found a measured difference; Gemini summarized the evidence.")
+
+    monkeypatch.setattr(GeminiAnalyst, "analyze", fail_tool_loop)
+    monkeypatch.setattr(GeminiAnalyst, "explain_calculated_insights", explain)
+    plan, results, explanation, used_gemini = analyze_question(
+        frame, "whats your insights about this data", "sample.csv", api_key="configured",
+    )
+    assert used_gemini
+    assert [operation.operation for operation in plan.operations] == ["discover_insights"]
+    assert captured["operations"] == ["dataset_overview", "discover_insights"]
+    assert captured["finding_count"] > 0
+    assert "Gemini summarized" in explanation.answer
 
 
 def test_general_insight_tool_ignores_incomplete_operation_guesses_and_scans_patterns():

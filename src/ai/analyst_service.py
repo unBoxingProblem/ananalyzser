@@ -326,7 +326,7 @@ def _records(frame: pd.DataFrame, limit: int = 50) -> list[dict[str, Any]]:
 def _discover_dataset_insights(dataframe: pd.DataFrame) -> pd.DataFrame:
     """Calculate useful general patterns without requiring Gemini to name columns."""
     profiles = profile_dataframe(dataframe)
-    numeric = [str(p.name) for p in profiles if p.semantic_type == "numeric" and not p.id_like and not p.constant]
+    numeric = [str(p.name) for p in profiles if p.semantic_type == "numeric" and not p.id_like and not p.constant][:30]
     categorical = [str(p.name) for p in profiles if p.semantic_type in {"categorical", "boolean"}
                    and not p.id_like and not p.constant and not p.high_cardinality]
     text_columns = []
@@ -378,6 +378,24 @@ def _discover_dataset_insights(dataframe: pd.DataFrame) -> pd.DataFrame:
             if abs(value) >= .4:
                 add("Numeric relationship", [first, second], f"{first} and {second} move together in a {value:+.2f} Pearson correlation.",
                     "Association only; correlation does not establish cause.")
+
+    # Measure associations between low-cardinality categories as well; this
+    # helps surface relationships that a numeric correlation matrix misses.
+    for index, first in enumerate(categorical[:12]):
+        for second in categorical[index + 1:12]:
+            pair = dataframe[[first, second]].dropna()
+            if len(pair) < 5 or pair[first].nunique() < 2 or pair[second].nunique() < 2:
+                continue
+            table = pd.crosstab(pair[first], pair[second]).to_numpy(dtype=float)
+            n = float(table.sum())
+            if not n or min(table.shape) < 2:
+                continue
+            expected = np.outer(table.sum(axis=1), table.sum(axis=0)) / n
+            chi_square = float(np.divide((table - expected) ** 2, expected, out=np.zeros_like(table), where=expected > 0).sum())
+            cramers_v = float(np.sqrt(chi_square / (n * min(table.shape[0] - 1, table.shape[1] - 1))))
+            if cramers_v >= .25:
+                add("Category association", [first, second], f"{first} and {second} are associated (Cramér’s V={cramers_v:.2f}).",
+                    "This is a descriptive relationship, not evidence that one category causes the other.")
 
     for group in categorical:
         counts = dataframe[group].value_counts(dropna=False)
@@ -932,6 +950,48 @@ class GeminiAnalyst:
             raise AnalystError(f"Pandas failed to execute the requested operation: {exc}") from exc
         return {"operations": [op.operation for op in normalized.operations], "results": results}, normalized.operations, results
 
+    def explain_calculated_insights(self, question: str, results: list[dict[str, Any]],
+                                   history: list[dict[str, str]] | None = None) -> ExplanationResponse:
+        """Ask Gemini to explain Pandas-computed insights without tool calls or raw rows."""
+        genai, types = _load_genai_sdk()
+        client = None
+        try:
+            client = genai.Client(api_key=self.api_key, http_options=types.HttpOptions(timeout=20000))
+            findings = next((item for item in results if item.get("operation") == "discover_insights"), {})
+            prompt = json.dumps({
+                "user_question": question[:2000],
+                "recent_conversation": (history or [])[-4:],
+                "calculated_pandas_findings": findings.get("records", []),
+                "interpretation_limits": findings.get("insight_note", "These are descriptive associations, not causation."),
+            }, ensure_ascii=False, default=str)
+            config = types.GenerateContentConfig(
+                system_instruction=(
+                    "You explain already-calculated dataset findings to a non-technical user. The findings were computed over the uploaded rows with Pandas. "
+                    "Do not request tools, operations, code, or more calculations. Do not invent values or imply that a correlation, category association, or group difference proves dependency or causation. "
+                    "Summarize the strongest patterns, name the columns and measured evidence, distinguish observations from hypotheses, and suggest practical follow-up questions."
+                ),
+                temperature=0.2,
+                max_output_tokens=1200,
+            )
+            response = client.models.generate_content(model=self.model, contents=prompt, config=config)
+            answer = str(getattr(response, "text", "") or "").strip()
+            if not answer:
+                raise GeminiProviderError("Gemini returned no explanation for the calculated findings.")
+            return ExplanationResponse(answer=answer)
+        except GeminiProviderError:
+            raise
+        except Exception as exc:
+            name = type(exc).__name__.lower()
+            if "timeout" in name or isinstance(exc, TimeoutError):
+                raise GeminiProviderError("Gemini request timed out while explaining the calculated findings.") from exc
+            raise GeminiProviderError("Gemini could not explain the calculated findings because its API request failed.") from exc
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
     def analyze(self, question: str, dataframe: pd.DataFrame, context: dict[str, Any], history: list[dict[str, str]],
                 dataset_id: str = "unknown", dashboard_store: DashboardStore | None = None) -> tuple[AnalysisPlan, list[dict[str, Any]], ExplanationResponse]:
         genai, types = _load_genai_sdk()
@@ -1087,6 +1147,21 @@ def analyze_question(dataframe: pd.DataFrame, question: str, dataset_name: str, 
                      ) -> tuple[AnalysisPlan, list[dict[str, Any]], ExplanationResponse, bool]:
     context = build_dataset_context(dataframe, dataset_name, is_cleaned=is_cleaned)
     dashboard_requested = GeminiAnalyst._dashboard_requested(question)
+    if _general_insight_request(question) and not dashboard_requested:
+        # Broad insight requests use one full Pandas scan followed by a single
+        # plain-language Gemini explanation. They never enter the multi-round
+        # function-call loop that can stall or overfit to one operation.
+        plan = AnalysisPlan.model_validate({"operations": [{"operation": "discover_insights"}]})
+        results = execute_plan(dataframe, plan)
+        if api_key:
+            try:
+                explanation = GeminiAnalyst(api_key, model).explain_calculated_insights(question, results, history)
+                return plan, results, explanation, True
+            except GeminiProviderError as exc:
+                explanation = _local_explanation(question, results)
+                explanation.answer += f" Gemini could not explain this result ({exc}); the findings above were still calculated with Pandas across the loaded dataset."
+                return plan, results, explanation, False
+        return plan, results, _local_explanation(question, results), False
     if api_key:
         try:
             plan, results, explanation = GeminiAnalyst(api_key, model).analyze(question, dataframe, context, history or [],
